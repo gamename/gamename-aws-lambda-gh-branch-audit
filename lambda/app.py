@@ -1,7 +1,7 @@
 """
 AWS Lambda function to identify non-main branches in GitHub repositories across all organizations owned by the
-authenticated user, indicating whether each branch is older than 72 hours, with a formatted table report using
-dynamic column widths.
+authenticated user, indicating whether each branch is older than 72 hours, with a formatted hierarchical report and
+repository count.
 
 This function:
 - Retrieves a GitHub Personal Access Token (PAT) from AWS Secrets Manager.
@@ -9,8 +9,12 @@ This function:
 - Fetches all organizations owned by the user.
 - Iterates through all repositories in these organizations (expected ~200 repos).
 - Identifies branches other than 'main' and checks if their HEAD commit is older than 72 hours based on committer.date.
-- Sends a plain-text email with a table report of non-main branches, via AWS SES.
-- Dynamically adjusts table column widths based on the longest org, repo, and branch names.
+- Sends a multipart email (HTML and plain-text) with a hierarchical report of non-main branches and a count of
+processed repositories, via AWS SES.
+- Lists each organization once, followed by its repositories (indented), and their branches (further indented) with
++72hrs status (Y/N).
+- Includes the day and date (e.g., 'Wednesday, July 02, 2025') in the email subject line.
+- Logs each organization and repository being processed to CloudWatch via print statements.
 - Handles GitHub API rate limits by pausing if remaining requests drop below 100.
 - Is designed to be triggered by a CloudWatch Events schedule (e.g., daily).
 
@@ -43,15 +47,32 @@ Error Handling:
 - Continues processing remaining orgs/repos if individual failures occur.
 - Returns HTTP 500 status code on unhandled exceptions.
 
+Logging:
+- Prints each organization and repository as they are processed (e.g., 'Processing organization: myorg1', 'Processing
+repo: repo1 in myorg1').
+- Logs errors and email success to CloudWatch via print statements.
+
 Output:
-- Sends an email with a table of non-main branches:
-  org          repo           branch            +72hrs
-  <dynamic>    <dynamic>      <dynamic>         ------
-  <org>        <repo>         <branch>          Y/N
-- Column widths for 'org', 'repo', and 'branch' adjust to the longest name found; '+72hrs' is fixed at 6 characters.
-- '+72hrs' indicates whether the branch's HEAD commit is older than 72 hours (Y=Yes, N=No).
-- If no non-main branches are found, sends: "No non-main branches found as of <timestamp>."
-- Logs progress and errors to CloudWatch via print statements.
+- Sends a multipart email with:
+  - HTML: Org in <h3>, repos in <p> with margin-left: 20px, branches in <p> with margin-left: 40px, format: <branch>,
+  Y/N, followed by repository count.
+  - Plain-text: Org as header, repos indented with 4 spaces, branches indented with 8 spaces, format: <branch>, Y/N,
+  followed by repository count.
+  - Subject: Includes day and date, e.g., 'GitHub Non-Main Branches Report - Wednesday, July 02, 2025'.
+  Example:
+    myorg1
+        repo1
+            dev, Y
+            feature/x, N
+        repo2
+            test, Y
+    org_name_with_length
+        repo3
+            staging, Y
+        repo4
+            test2, N
+    Total repositories processed: 200
+- If no non-main branches are found, sends: "No non-main branches found as of <timestamp>." with the repository count.
 
 Setup Notes:
 - Lambda timeout: 5 minutes (sufficient for ~200 repos, ~2-3 minutes execution with commit checks).
@@ -60,15 +81,37 @@ Setup Notes:
 - SES: Sender and recipient emails must be verified in us-east-1 (if in sandbox mode).
 - CloudWatch: Schedule with 'rate(1 day)' for daily execution.
 
-Example Email Output:
-  Subject: GitHub Non-Main Branches Report
-  Non-main branches found as of 2025-07-02T15:49:00:
-  org_name_with_length   repo_name     branch_name_with_length   +72hrs
-  --------------------   -----------   -----------------------   ------
-  myorg1                 repo1         dev                       Y
-  myorg1                 repo2         feature/x                 N
-  org_name_with_length   repo3         staging                   Y
-  org_name_with_length   repo4         test                      N
+Example Email Output (Plain-text):
+  Subject: GitHub Non-Main Branches Report - Wednesday, July 02, 2025
+  Non-main branches found as of 2025-07-02T15:58:00:
+  myorg1
+      repo1
+          dev, Y
+          feature/x, N
+      repo2
+          test, Y
+  org_name_with_length
+      repo3
+          staging, Y
+      repo4
+          test2, N
+  Total repositories processed: 200
+Example HTML Output (rendered):
+  <p>Non-main branches found as of 2025-07-02T15:58:00:</p>
+  <div style="font-family: Arial, sans-serif;">
+  <h3>myorg1</h3>
+  <p style="margin-left: 20px;">repo1</p>
+  <p style="margin-left: 40px;">dev, Y</p>
+  <p style="margin-left: 40px;">feature/x, N</p>
+  <p style="margin-left: 20px;">repo2</p>
+  <p style="margin-left: 40px;">test, Y</p>
+  <h3>org_name_with_length</h3>
+  <p style="margin-left: 20px;">repo3</p>
+  <p style="margin-left: 40px;">staging, Y</p>
+  <p style="margin-left: 20px;">repo4</p>
+  <p style="margin-left: 40px;">test2, N</p>
+  <p>Total repositories processed: 200</p>
+  </div>
 """
 
 import json
@@ -90,8 +133,9 @@ def get_secret(secret_name):
         print(f"Error retrieving secret: {str(e)}")
         raise e
 
-def send_email(sender, recipient, subject, body):
-    """Send email via AWS SES"""
+
+def send_email(sender, recipient, subject, html_body, text_body):
+    """Send multipart email (HTML and plain-text) via AWS SES"""
     ses = boto3.client('ses')
     try:
         ses.send_email(
@@ -99,7 +143,10 @@ def send_email(sender, recipient, subject, body):
             Destination={'ToAddresses': [recipient]},
             Message={
                 'Subject': {'Data': subject},
-                'Body': {'Text': {'Data': body}}
+                'Body': {
+                    'Text': {'Data': text_body},
+                    'Html': {'Data': html_body}
+                }
             }
         )
         print("Email sent successfully")
@@ -133,14 +180,12 @@ def lambda_handler(event, context):
         # Initialize GitHub client
         g = Github(github_token)
 
-        # Collect non-main branches and track max lengths
-        non_main_branches = []
-        max_org_length = len("org")
-        max_repo_length = len("repo")
-        max_branch_length = len("branch")
-
+        # Collect non-main branches, grouped by org and repo
+        branches_by_org = {}
+        repo_count = 0
         try:
             check_rate_limit(g)
+            print("Fetching organizations")
             orgs = g.get_user().get_orgs()
         except Exception as e:
             print(f"Error fetching organizations: {str(e)}")
@@ -149,11 +194,13 @@ def lambda_handler(event, context):
         for org in orgs:
             try:
                 check_rate_limit(g)
-                max_org_length = max(max_org_length, len(org.login))
+                print(f"Processing organization: {org.login}")
+                branches_by_org[org.login] = {}
                 for repo in org.get_repos():
                     try:
                         check_rate_limit(g)
-                        max_repo_length = max(max_repo_length, len(repo.name))
+                        print(f"Processing repo: {repo.name} in {org.login}")
+                        repo_count += 1
                         branches = repo.get_branches()
                         for branch in branches:
                             if branch.name != 'main':
@@ -165,10 +212,9 @@ def lambda_handler(event, context):
                                     # Calculate age in seconds
                                     age_seconds = (datetime.now(timezone.utc) - commit_date).total_seconds()
                                     is_stale = age_seconds > 72 * 3600  # 72 hours in seconds
-                                    max_branch_length = max(max_branch_length, len(branch.name))
-                                    non_main_branches.append({
-                                        'org': org.login,
-                                        'repo': repo.name,
+                                    if repo.name not in branches_by_org[org.login]:
+                                        branches_by_org[org.login][repo.name] = []
+                                    branches_by_org[org.login][repo.name].append({
                                         'branch': branch.name,
                                         'stale': is_stale
                                     })
@@ -180,33 +226,46 @@ def lambda_handler(event, context):
                 print(f"Error processing organization {org.login}: {str(e)}")
 
         # Prepare email content
-        if non_main_branches:
-            # Sort by org, repo, branch for consistent output
-            non_main_branches.sort(key=lambda x: (x['org'], x['repo'], x['branch']))
-            # Table header
-            branch_list = [
-                f"{'org'.ljust(max_org_length)}   {'repo'.ljust(max_repo_length)}   "
-                f"{'branch'.ljust(max_branch_length)}   +72hrs",
-                f"{'-' * max_org_length}   {'-' * max_repo_length}   {'-' * max_branch_length}   ------"
-            ]
-            # Table rows
-            for branch in non_main_branches:
-                branch_list.append(
-                    f"{branch['org'].ljust(max_org_length)}   "
-                    f"{branch['repo'].ljust(max_repo_length)}   "
-                    f"{branch['branch'].ljust(max_branch_length)}   "
-                    f"{'Y' if branch['stale'] else 'N'}"
-                )
-            email_body = (
+        if branches_by_org:
+            # Plain-text report
+            text_lines = []
+            html_lines = ['<div style="font-family: Arial, sans-serif;">']
+            for org_name, repos in sorted(branches_by_org.items()):
+                if repos:  # Only include orgs with non-main branches
+                    text_lines.append(org_name)
+                    html_lines.append(f'<h3>{org_name}</h3>')
+                    for repo_name, branches in sorted(repos.items()):
+                        text_lines.append(f"    {repo_name}")
+                        html_lines.append(f'<p style="margin-left: 20px;">{repo_name}</p>')
+                        for branch in sorted(branches, key=lambda x: x['branch']):
+                            text_lines.append(f"        {branch['branch']}, {'Y' if branch['stale'] else 'N'}")
+                            html_lines.append(
+                                f'<p style="margin-left: 40px;">{branch["branch"]}, '
+                                f'{"Y" if branch["stale"] else "N"}</p>')
+            text_lines.append(f"\nTotal repositories processed: {repo_count}")
+            html_lines.append(f'<p>Total repositories processed: {repo_count}</p>')
+            html_lines.append('</div>')
+            text_body = (
                 f"Non-main branches found as of {datetime.utcnow().isoformat()}:\n\n"
-                f"\n".join(branch_list)
+                f"\n".join(text_lines)
+            )
+            html_body = (
+                f'<p>Non-main branches found as of {datetime.utcnow().isoformat()}:</p>'
+                f'\n{"".join(html_lines)}'
             )
         else:
-            email_body = f"No non-main branches found as of {datetime.utcnow().isoformat()}."
+            text_body = (
+                f"No non-main branches found as of {datetime.utcnow().isoformat()}.\n\n"
+                f"Total repositories processed: {repo_count}"
+            )
+            html_body = (
+                f"<p>No non-main branches found as of {datetime.utcnow().isoformat()}.</p>"
+                f"<p>Total repositories processed: {repo_count}</p>"
+            )
 
-        # Send email
-        subject = "GitHub Non-Main Branches Report"
-        send_email(sender_email, recipient_email, subject, email_body)
+        # Send email with day and date in subject
+        subject = f"GitHub Non-Main Branches Report - {datetime.now().strftime('%A, %B %d, %Y')}"
+        send_email(sender_email, recipient_email, subject, html_body, text_body)
 
         return {
             'statusCode': 200,
